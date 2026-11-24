@@ -94,6 +94,9 @@ SDL3_mixer_0.0.0 {
     MIX_LoadAudioNoCopy;
     MIX_LockMixer;
     MIX_UnlockMixer;
+    MIX_PauseGroup;
+    MIX_ResumeGroup;
+    MIX_StopGroup;
     # extra symbols go here (don't modify this line)
   local: *;
 };

@@ -3051,6 +3051,70 @@ bool MIX_SetGroupPostMixCallback(MIX_Group *group, MIX_GroupMixCallback cb, void
     return true;
 }
 
+bool MIX_PauseGroup(MIX_Group *group)
+{
+    if (!CheckGroupParam(group)) {
+        return false;
+    }
+
+    MIX_Mixer *mixer = group->mixer;
+
+    // Hold the mixer lock for the whole operation, so the set of paused tracks
+    //  is exactly the group's membership at this point in time, and no track can
+    //  leave or join the group while we're iterating it.
+    LockMixer(mixer);
+    for (MIX_Track *track = group->tracks; track != NULL; track = track->group_next) {
+        PauseTrack(track);
+    }
+    UnlockMixer(mixer);
+
+    return true;
+}
+
+bool MIX_ResumeGroup(MIX_Group *group)
+{
+    if (!CheckGroupParam(group)) {
+        return false;
+    }
+
+    MIX_Mixer *mixer = group->mixer;
+
+    // Hold the mixer lock for the whole operation, so the set of resumed tracks
+    //  is exactly the group's membership at this point in time, and no track can
+    //  leave or join the group while we're iterating it.
+    LockMixer(mixer);
+    for (MIX_Track *track = group->tracks; track != NULL; track = track->group_next) {
+        ResumeTrack(track);
+    }
+    UnlockMixer(mixer);
+
+    return true;
+}
+
+bool MIX_StopGroup(MIX_Group *group, Sint64 fade_out_ms)
+{
+    if (!CheckGroupParam(group)) {
+        return false;
+    }
+
+    MIX_Mixer *mixer = group->mixer;
+
+    // Hold the mixer lock for the whole operation, so the set of stopped tracks
+    //  is exactly the group's membership at this point in time, and no track can
+    //  leave or join the group while we're iterating it.
+    LockMixer(mixer);
+    for (MIX_Track *track = group->tracks; track != NULL; track = track->group_next) {
+        Sint64 fade_out_frames = MIX_TrackMSToFrames(track, fade_out_ms);
+        if (fade_out_frames < 0) {
+            fade_out_frames = 0;
+        }
+        StopTrack(track, (fade_out_ms > 0) ? fade_out_frames : -1);
+    }
+    UnlockMixer(mixer);
+
+    return true;
+}
+
 MIX_AudioDecoder * MIX_CreateAudioDecoder_IO(SDL_IOStream *io, bool closeio, SDL_PropertiesID props)
 {
     if (!CheckInitialized()) {

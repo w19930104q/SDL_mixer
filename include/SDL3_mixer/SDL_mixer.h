@@ -2255,6 +2255,85 @@ extern SDL_DECLSPEC bool SDLCALL MIX_ResumeAllTracks(MIX_Mixer *mixer);
 extern SDL_DECLSPEC bool SDLCALL MIX_ResumeTag(MIX_Mixer *mixer, const char *tag);
 
 /**
+ * Pause every track currently assigned to a mixing group.
+ *
+ * A paused track is not considered "stopped," so its MIX_TrackStoppedCallback
+ * will not fire if paused, but it won't change state by default, generate
+ * audio, or generally make progress, until it is resumed.
+ *
+ * This only affects tracks that are members of the group at the moment this
+ * function is called; tracks assigned to other groups, or to no app-created
+ * group at all, are left untouched. A track that is moved to another group
+ * after being paused this way stays paused, but later operations on this group
+ * will not reach it, as it is no longer a member.
+ *
+ * Group members that aren't currently playing are ignored.
+ *
+ * \param group the group whose tracks are paused.
+ * \returns true on success, false on error; call SDL_GetError() for details.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.0.0.
+ *
+ * \sa MIX_ResumeGroup
+ * \sa MIX_PauseTrack
+ * \sa MIX_SetTrackGroup
+ */
+extern SDL_DECLSPEC bool SDLCALL MIX_PauseGroup(MIX_Group *group);
+
+/**
+ * Resume every track currently assigned to a mixing group.
+ *
+ * This only affects tracks that are members of the group at the moment this
+ * function is called; tracks assigned to other groups, or to no app-created
+ * group at all, are left untouched. A track that was moved to another group
+ * after being paused will not be resumed by this call, as it is no longer a
+ * member.
+ *
+ * Group members that aren't currently paused are ignored.
+ *
+ * \param group the group whose tracks are resumed.
+ * \returns true on success, false on error; call SDL_GetError() for details.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.0.0.
+ *
+ * \sa MIX_PauseGroup
+ * \sa MIX_ResumeTrack
+ * \sa MIX_SetTrackGroup
+ */
+extern SDL_DECLSPEC bool SDLCALL MIX_ResumeGroup(MIX_Group *group);
+
+/**
+ * Halt every track currently assigned to a mixing group.
+ *
+ * This follows all the same rules as MIX_StopTrack() for each affected track;
+ * please refer to its documentation for the details of the fade-out behavior.
+ *
+ * This only affects tracks that are members of the group at the moment this
+ * function is called; tracks assigned to other groups, or to no app-created
+ * group at all, are left untouched. A track that is moved to another group
+ * after being stopped cannot be reached by later operations on this group, as
+ * it is no longer a member.
+ *
+ * \param group the group whose tracks are stopped.
+ * \param fade_out_ms the number of milliseconds to fade each track out before
+ *                    stopping, or zero to stop them immediately.
+ * \returns true on success, false on error; call SDL_GetError() for details.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.0.0.
+ *
+ * \sa MIX_StopTrack
+ * \sa MIX_PauseGroup
+ * \sa MIX_SetTrackGroup
+ */
+extern SDL_DECLSPEC bool SDLCALL MIX_StopGroup(MIX_Group *group, Sint64 fade_out_ms);
+
+/**
  * Query if a track is currently playing.
  *
  * If this returns true, the track is currently contributing to the mixer's
