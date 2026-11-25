@@ -127,6 +127,136 @@ static void UnlockTrack(MIX_Track *track)
     SDL_UnlockAudioStream(track->output_stream);
 }
 
+// Frame units: the decoder and track->position speak the input stream's sample
+// rate, while loop boundaries configured by the app and the remaining-frame
+// query speak the mixer's output rate. These convert between the two. A track
+// without an input stream is treated as 1:1 (MIX_SetTrackAudioStream input).
+static int TrackInputFreq(MIX_Track *track)
+{
+    if (track->input_stream) {
+        SDL_AudioSpec spec;
+        SDL_GetAudioStreamFormat(track->input_stream, &spec, NULL);
+        if (spec.freq > 0) {
+            return spec.freq;
+        }
+    }
+    return track->output_spec.freq;
+}
+
+static int TrackOutputFreq(MIX_Track *track)
+{
+    return track->output_spec.freq > 0 ? track->output_spec.freq : track->mixer->spec.freq;
+}
+
+static Sint64 OutputFramesToInputFrames(MIX_Track *track, Sint64 out_frames)
+{
+    if (out_frames < 0) {
+        return out_frames;
+    }
+    const int infreq = TrackInputFreq(track);
+    const int outfreq = TrackOutputFreq(track);
+    if (infreq == outfreq) {
+        return out_frames;
+    }
+    return (Sint64) (((double) out_frames * (double) infreq) / (double) outfreq);
+}
+
+static Sint64 InputFramesToOutputFrames(MIX_Track *track, Sint64 in_frames)
+{
+    if (in_frames < 0) {
+        return in_frames;
+    }
+    const int infreq = TrackInputFreq(track);
+    const int outfreq = TrackOutputFreq(track);
+    if (infreq == outfreq) {
+        return in_frames;
+    }
+    return (Sint64) (((double) in_frames * (double) outfreq) / (double) infreq);
+}
+
+// The playback head, in the mixer's output frame unit. It only moves when
+// converted frames actually leave the output stream, so resampler prefetch
+// that is still buffered inside the stream can never run it ahead.
+static Sint64 CurrentOutputPosition(MIX_Track *track)
+{
+    return (Sint64) track->output_position;
+}
+
+// Hard realignment from an API call (play/seek/reconfigure), where nothing is
+// in flight. Frames scheduled under the previous schedule are discarded so
+// they can neither be mixed twice nor run the position ahead. The output
+// stream's lock is recursive, so this is safe even from its get callback.
+static void AlignTrackPosition(MIX_Track *track, Sint64 input_frames)
+{
+    track->position = (Uint64) input_frames;
+    if (track->output_stream) {
+        SDL_ClearAudioStream(track->output_stream);
+    }
+    track->output_position = (Uint64) InputFramesToOutputFrames(track, input_frames);
+}
+
+// The effective end of the current pass over the audio, in output frames:
+// a configured loop end wins, otherwise a max_frame, otherwise the decoder's
+// full duration, otherwise -1 (end of input not known in frames).
+static Sint64 TrackOutputEnd(MIX_Track *track)
+{
+    Sint64 end_output = track->loop_end_output;  // -1 if no explicit loop end.
+    if (track->max_frame >= 0) {
+        const Sint64 max_output = InputFramesToOutputFrames(track, track->max_frame);
+        if ((end_output < 0) || (max_output < end_output)) {
+            end_output = max_output;
+        }
+    }
+    if ((end_output < 0) && track->input_audio && (track->input_audio->duration_frames >= 0)) {
+        end_output = InputFramesToOutputFrames(track, track->input_audio->duration_frames);
+    }
+    return end_output;
+}
+
+// Advance the playback head by mixer output frames that just left the output
+// stream. When a loop is active the head wraps at the loop end, so it tracks
+// the repeating content exactly even though the rewind itself happens deeper
+// in the pipeline while the last iteration's frames are still queued.
+static void AdvanceOutputPosition(MIX_Track *track, int frames)
+{
+    Sint64 head = (Sint64) track->output_position + frames;
+    if (track->loops_remaining != 0) {
+        const Sint64 start = track->loop_start_output;  // defaults to 0.
+        Sint64 end = track->loop_end_output;
+        if (end < 0) {
+            end = TrackOutputEnd(track);  // an end-of-input loop wraps at the full duration.
+        }
+        if ((end >= 0) && (start >= 0) && (end > start)) {
+            const Sint64 span = end - start;
+            while (head >= end) {
+                head -= span;
+            }
+        }
+    }
+    track->output_position = (Uint64) ((head > 0) ? head : 0);
+}
+
+// Like GetTrackOptionFramesOrTicks, but the millisecond form is converted in
+// the mixer's output frame unit, so loop boundaries are always specified and
+// stored in output frames regardless of the input sample rate.
+static Sint64 GetTrackOutputOptionFramesOrTicks(MIX_Track *track, SDL_PropertiesID options, const char *framesprop, const char *msprop, Sint64 defval)
+{
+    if (SDL_HasProperty(options, framesprop)) {
+        return SDL_GetNumberProperty(options, framesprop, defval);
+    } else if (SDL_HasProperty(options, msprop)) {
+        const Sint64 val = SDL_GetNumberProperty(options, msprop, defval);
+        if (val < 0) {
+            return val;
+        }
+        Sint64 val_frames = MIX_MSToFrames(TrackOutputFreq(track), val);
+        if (val_frames < 0) {
+            val_frames = 0;
+        }
+        return val_frames;
+    }
+    return defval;
+}
+
 static bool CheckInitialized(void)
 {
     if (!mixer_initialized) {
@@ -395,9 +525,14 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
             //  even if the finish callback would restart the track. As such, the outer loop is mostly here to deal with looping tracks
             //  and finish callbacks that restart the track.
 
-            // if this would put us past the end of maxframes, or a fadeout, clamp br and set end_of_audio=true so we can do looping, etc.
-            Sint64 maxpos = -1;
-            if (track->max_frame >= 0) {
+            // Bound the read against the loop end / max frame / fade out.
+            // Loop ends are specified in output frames and mirrored to input
+            //  frames; the decoder position is exact in input units, so the
+            //  clamp never lets a resampler batch carry a tail frame past it.
+            Sint64 maxpos = -1;  // input-frame exclusive cap for this read.
+            if (track->loop_end >= 0) {
+                maxpos = (Sint64) track->loop_end;
+            } else if (track->max_frame >= 0) {
                 maxpos = track->max_frame;
             }
             if (track->fade_direction < 0) {
@@ -412,7 +547,7 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
             int frames_read = br / (sizeof (float) * raw_channels);
             if (maxpos >= 0) {
                 const Sint64 newpos = (Sint64)(track->position + frames_read);
-                if (newpos >= maxpos) {  // we read past the end of the fade out or maxframes, we need to clamp.
+                if (newpos >= maxpos) {  // maxpos is exclusive: emit exactly up to it (no extra frame), then handle the boundary.
                     br -= (int)(((newpos - maxpos) * raw_channels) * sizeof(float));
                     if (br < 0) {
                         br = 0;
@@ -461,7 +596,11 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
                     if (!track->input_audio->decoder->seek(track->decoder_userdata, track->loop_start)) {
                         track_stopped = true;  // uhoh, can't seek! Abandon ship!
                     } else {
-                        track->position = track->loop_start;
+                        // The output playback head is advanced and wrapped in
+                        //  MixerCallback as the still-queued tail frames leave
+                        //  the output stream; here only the decoder-side input
+                        //  position jumps back.
+                        track->position = (Uint64) track->loop_start;
                     }
                 }
             }
@@ -587,6 +726,11 @@ static void SDLCALL MixerCallback(void *userdata, SDL_AudioStream *stream, int a
             const int to_be_read = (additional_amount / SDL_AUDIO_FRAMESIZE(mixer->spec)) * SDL_AUDIO_FRAMESIZE(track->output_spec);
             const int br = SDL_GetAudioStreamData(track->output_stream, getbuf, to_be_read);
             if (br > 0) {
+                // These are real mixer output frames leaving the track; move
+                //  the playback head here (not at input time) so it stays exact
+                //  regardless of resampler prefetch, wrapping at loop end.
+                AdvanceOutputPosition(track, br / SDL_AUDIO_FRAMESIZE(track->output_spec));
+
                 if (track->cooked_callback) {
                     track->cooked_callback(track->cooked_callback_userdata, track, &track->output_spec, getbuf, br / sizeof (float));
                 }
@@ -1667,7 +1811,12 @@ static bool MIX_SetTrackAudio_internal(MIX_Track *track, MIX_Audio *audio, SDL_I
                 track->input_audio = audio;
                 track->input_stream = track->internal_stream;
                 SDL_ClearAudioStream(track->input_stream);   // make sure that any extra buffered input from before is removed.
+                SDL_ClearAudioStream(track->output_stream);  // and nothing converted from the old input either.
                 track->position = 0;
+                track->output_position = 0;
+                track->loop_end = -1;
+                track->loop_start_output = -1;
+                track->loop_end_output = -1;
                 track->io = io;
                 track->closeio = closeio;
             }
@@ -1742,7 +1891,12 @@ bool MIX_SetTrackAudioStream(MIX_Track *track, SDL_AudioStream *stream)
     }
 
     track->input_stream = stream;
+    SDL_ClearAudioStream(track->output_stream);  // drop anything converted from the previous input.
     track->position = 0;
+    track->output_position = 0;
+    track->loop_end = -1;
+    track->loop_start_output = -1;
+    track->loop_end_output = -1;
     UnlockTrack(track);
 
     return true;
@@ -2058,10 +2212,14 @@ bool MIX_SetTrackPlaybackPosition(MIX_Track *track, Sint64 frames)
             retval = SDL_SetError("No audio currently assigned to this track");
         }
     } else {
-        retval = track->input_audio->decoder->seek(track->decoder_userdata, (Uint64) frames);
+        // frames are in the mixer's output frame unit; convert to decoder units.
+        const Sint64 input_frames = OutputFramesToInputFrames(track, frames);
+        retval = track->input_audio->decoder->seek(track->decoder_userdata, (Uint64) input_frames);
         if (retval) {
             SDL_ClearAudioStream(track->input_stream);   // make sure that any extra buffered input from before the seek is removed.
-            track->position = (Uint64) frames;
+            AlignTrackPosition(track, input_frames);
+            // honor the requested output-frame target exactly (it may differ by rounding).
+            track->output_position = (Uint64) frames;
         }
     }
     UnlockTrack(track);
@@ -2074,7 +2232,7 @@ Sint64 MIX_GetTrackPlaybackPosition(MIX_Track *track)
     Sint64 retval = -1;
     if (CheckTrackParam(track)) {
         LockTrack(track);
-        retval = (Sint64) track->position;
+        retval = CurrentOutputPosition(track);  // report in the mixer's output frame unit.
         UnlockTrack(track);
     }
     return retval;
@@ -2085,14 +2243,16 @@ Sint64 MIX_GetTrackRemaining(MIX_Track *track)
     Sint64 retval = -1;
     if (CheckTrackParam(track)) {
         LockTrack(track);
-        const Sint64 position = (Sint64) track->position;
-        const Sint64 duration = track->input_audio ? track->input_audio->duration_frames : -1;
+        const Sint64 position = CurrentOutputPosition(track);  // output-frame unit.
+        // Effective end in the same output-frame unit, so the subtraction is
+        //  linear in what the app sees.
+        const Sint64 end_output = TrackOutputEnd(track);
         const bool stopped = (track->state == MIX_STATE_STOPPED);
         UnlockTrack(track);
         if (stopped) {
             retval = 0;
-        } else if ((duration >= 0) && (position >= 0) && (position <= duration)) {
-            retval = duration - position;
+        } else if ((end_output >= 0) && (position >= 0) && (position <= end_output)) {
+            retval = end_output - position;  // decreases linearly as output frames are mixed.
         }
     }
     return retval;
@@ -2135,6 +2295,75 @@ bool MIX_SetTrackLoops(MIX_Track *track, int num_loops)
         track->loops_remaining = num_loops;
         UnlockTrack(track);
         retval = true;
+    }
+    return retval;
+}
+
+// Apply output-frame loop boundaries to the track. Call with the track lock held.
+static void ApplyTrackLoopPoints(MIX_Track *track, Sint64 start_output, Sint64 end_output)
+{
+    track->loop_start_output = start_output;
+    track->loop_end_output = end_output;
+    track->loop_start = (int) OutputFramesToInputFrames(track, start_output);
+    track->loop_end = OutputFramesToInputFrames(track, end_output);
+}
+
+bool MIX_SetTrackLoopPoints(MIX_Track *track, Sint64 loop_start, Sint64 loop_end)
+{
+    if (!CheckTrackParam(track)) {
+        return false;
+    } else if ((loop_start < -1) || (loop_end < -1) || ((loop_end >= 0) && (loop_start >= 0) && (loop_end <= loop_start))) {
+        return SDL_InvalidParamError("loop_start/loop_end");
+    }
+
+    bool retval = true;
+    LockTrack(track);
+
+    Sint64 start_output = (loop_start >= 0) ? loop_start : track->loop_start_output;
+    Sint64 end_output = (loop_end >= 0) ? loop_end : -1;  // a negative argument explicitly disables an end point.
+    if (start_output < 0) {
+        start_output = 0;
+    }
+
+    ApplyTrackLoopPoints(track, start_output, end_output);
+
+    // Discard data decoded/buffered under the previous schedule so tail frames
+    //  from the old loop can never leak into the reconfigured loop.
+    if (track->input_audio && track->internal_stream) {
+        if (!track->input_audio->decoder->seek(track->decoder_userdata, track->loop_start)) {
+            retval = false;
+        } else {
+            SDL_ClearAudioStream(track->internal_stream);
+            AlignTrackPosition(track, track->loop_start);
+            // honor the app's output-frame boundary exactly (it may differ by rounding).
+            track->output_position = (Uint64) start_output;
+        }
+    } else if (track->internal_stream) {
+        SDL_ClearAudioStream(track->internal_stream);
+    }
+
+    UnlockTrack(track);
+    return retval;
+}
+
+Sint64 MIX_GetTrackLoopStart(MIX_Track *track)
+{
+    Sint64 retval = -1;
+    if (CheckTrackParam(track)) {
+        LockTrack(track);
+        retval = track->loop_start_output;
+        UnlockTrack(track);
+    }
+    return retval;
+}
+
+Sint64 MIX_GetTrackLoopEnd(MIX_Track *track)
+{
+    Sint64 retval = -1;
+    if (CheckTrackParam(track)) {
+        LockTrack(track);
+        retval = track->loop_end_output;
+        UnlockTrack(track);
     }
     return retval;
 }
@@ -2265,7 +2494,8 @@ bool MIX_PlayTrack(MIX_Track *track, SDL_PropertiesID options)
     int loops = 0;
     Sint64 max_frame = -1;
     Sint64 start_pos = 0;
-    Sint64 loop_start = 0;
+    Sint64 loop_start_output = 0;
+    Sint64 loop_end_output = -1;
     Sint64 fade_in = 0;
     Sint64 append_silence_frames = 0;
     int start_order = -1;
@@ -2277,7 +2507,8 @@ bool MIX_PlayTrack(MIX_Track *track, SDL_PropertiesID options)
         loops = (int) SDL_GetNumberProperty(options, MIX_PROP_PLAY_LOOPS_NUMBER, loops);
         max_frame = GetTrackOptionFramesOrTicks(track, options, MIX_PROP_PLAY_MAX_FRAME_NUMBER, MIX_PROP_PLAY_MAX_MILLISECONDS_NUMBER, max_frame);
         start_pos = GetTrackOptionFramesOrTicks(track, options, MIX_PROP_PLAY_START_FRAME_NUMBER, MIX_PROP_PLAY_START_MILLISECOND_NUMBER, start_pos);
-        loop_start = GetTrackOptionFramesOrTicks(track, options, MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER, MIX_PROP_PLAY_LOOP_START_MILLISECOND_NUMBER, loop_start);
+        loop_start_output = GetTrackOutputOptionFramesOrTicks(track, options, MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER, MIX_PROP_PLAY_LOOP_START_MILLISECOND_NUMBER, loop_start_output);
+        loop_end_output = GetTrackOutputOptionFramesOrTicks(track, options, MIX_PROP_PLAY_LOOP_END_FRAME_NUMBER, MIX_PROP_PLAY_LOOP_END_MILLISECOND_NUMBER, loop_end_output);
         fade_in = GetTrackOptionFramesOrTicks(track, options, MIX_PROP_PLAY_FADE_IN_FRAMES_NUMBER, MIX_PROP_PLAY_FADE_IN_MILLISECONDS_NUMBER, fade_in);
         fade_start_gain = SDL_GetFloatProperty(options, MIX_PROP_PLAY_FADE_IN_START_GAIN_FLOAT, fade_start_gain);
         append_silence_frames = GetTrackOptionFramesOrTicks(track, options, MIX_PROP_PLAY_APPEND_SILENCE_FRAMES_NUMBER, MIX_PROP_PLAY_APPEND_SILENCE_MILLISECONDS_NUMBER, append_silence_frames);
@@ -2288,8 +2519,12 @@ bool MIX_PlayTrack(MIX_Track *track, SDL_PropertiesID options)
             start_pos = 0;
         }
 
-        if (loop_start < 0) {
-            loop_start = 0;
+        if (loop_start_output < 0) {
+            loop_start_output = 0;
+        }
+
+        if (loop_end_output == 0) {
+            loop_end_output = -1;  // a non-positive loop end makes no sense, treat as disabled.
         }
 
         if (append_silence_frames < 0) {
@@ -2314,16 +2549,28 @@ bool MIX_PlayTrack(MIX_Track *track, SDL_PropertiesID options)
         return SDL_SetError("Playing an input stream (not MIX_Audio) with a non-zero start position");  // !!! FIXME: should we just read off this many frames right now instead?
     }
 
+    // Loop boundaries are stored in output-frame units; mirror them into the
+    // input-frame units the decoder and clamp logic operate in.
+    const Sint64 loop_start_input = OutputFramesToInputFrames(track, loop_start_output);
+    const Sint64 loop_end_input = OutputFramesToInputFrames(track, loop_end_output);
+
+    if (track->internal_stream) {
+        SDL_ClearAudioStream(track->internal_stream);  // discard anything scheduled under a previous loop configuration.
+    }
+
     track->max_frame = max_frame;
     track->loops_remaining = loops;
-    track->loop_start = (int) loop_start;
+    track->loop_start = (int) loop_start_input;
+    track->loop_end = loop_end_input;
+    track->loop_start_output = loop_start_output;
+    track->loop_end_output = loop_end_output;
     track->total_fade_frames = (fade_in > 0) ? fade_in : 0;
     track->fade_frames = track->total_fade_frames;
     track->fade_direction = (fade_in > 0) ? 1 : 0;
     track->fade_start_gain = fade_start_gain;
     track->silence_frames = (append_silence_frames > 0) ? -append_silence_frames : 0;  // negative means "there is still actual audio data to play", positive means "we're done with actual data, feed silence now." Zero means no silence (left) to feed.
     track->state = MIX_STATE_PLAYING;
-    track->position = start_pos;
+    AlignTrackPosition(track, start_pos);
     track->halt_when_exhausted = halt_when_exhausted;
 
     UnlockTrack(track);

@@ -1444,10 +1444,11 @@ extern SDL_DECLSPEC MIX_Track ** SDLCALL MIX_GetTaggedTracks(MIX_Mixer *mixer, c
  * On a playing track, the next time the mixer runs, it will start mixing from
  * the new position.
  *
- * Position is defined in _sample frames_ of decoded audio, not units of time,
- * so that sample-perfect mixing can be achieved. To instead operate in units
- * of time, use MIX_TrackMSToFrames() to get the approximate sample frames for
- * a given tick.
+ * Position is defined in _sample frames_ of the mixer's output (the same unit
+ * reported by MIX_GetTrackPlaybackPosition() and used for loop points), not
+ * units of time, so that sample-perfect mixing can be achieved even when the
+ * input is resampled for the mixer. To instead operate in units of time, use
+ * MIX_TrackMSToFrames() to get the approximate sample frames for a given tick.
  *
  * This function requires an input that can seek (so it can not be used if the
  * input was set with MIX_SetTrackAudioStream()), and a audio file format that
@@ -1473,15 +1474,16 @@ extern SDL_DECLSPEC MIX_Track ** SDLCALL MIX_GetTaggedTracks(MIX_Mixer *mixer, c
 extern SDL_DECLSPEC bool SDLCALL MIX_SetTrackPlaybackPosition(MIX_Track *track, Sint64 frames);
 
 /**
- * Get the current input position of a playing track.
+ * Get the current output position of a playing track.
  *
  * (Not to be confused with MIX_GetTrack3DPosition(), which is positioning of
  * the track in 3D space, not the playback position of its audio data.)
  *
- * Position is defined in _sample frames_ of decoded audio, not units of time,
- * so that sample-perfect mixing can be achieved. To instead operate in units
- * of time, use MIX_TrackFramesToMS() to convert the return value to
- * milliseconds.
+ * Position is defined in _sample frames_ of the mixer's output (the same unit
+ * used for loop points and MIX_GetTrackRemaining()), not units of time, so
+ * that sample-perfect mixing can be achieved even when the input is resampled
+ * for the mixer. To instead operate in units of time, use
+ * MIX_TrackFramesToMS() to convert the return value to milliseconds.
  *
  * Stopped and paused tracks will report the position when they halted.
  * Playing tracks will report the current position, which will change over
@@ -1583,6 +1585,84 @@ extern SDL_DECLSPEC int SDLCALL MIX_GetTrackLoops(MIX_Track *track);
 extern SDL_DECLSPEC bool SDLCALL MIX_SetTrackLoops(MIX_Track *track, int num_loops);
 
 /**
+ * Set the loop points of a currently-playing track.
+ *
+ * Loop points are expressed in _output sample frames_: the frame unit of the
+ * mixer the track belongs to, regardless of the sample rate of the track's
+ * input. This matches the frame unit reported by MIX_GetTrackPlaybackPosition()
+ * and MIX_GetTrackRemaining(), so an app can schedule loops against the values
+ * it observes, even when the input is being resampled for the mixer.
+ *
+ * `loop_start` is the position playback jumps back to every time it reaches
+ * `loop_end`. `loop_end` is exclusive: playback emits frames up to, but not
+ * including, the end point, so no extra frame is mixed at the tail of a loop
+ * iteration. Passing a negative value for either argument leaves that
+ * boundary unchanged; pass a negative `loop_end` to disable an explicit loop
+ * end (the track then only rewinds at end of input).
+ *
+ * The boundaries are stored in output-frame units and are re-applied to the
+ * decoder as needed. Any input already decoded past the new end point is
+ * discarded, so a reconfigured loop never retains tail data scheduled for the
+ * previous loop.
+ *
+ * Looping still requires a seekable MIX_Audio input and a non-zero loop count
+ * (see MIX_SetTrackLoops() and MIX_PROP_PLAY_LOOPS_NUMBER) to actually rewind.
+ *
+ * \param track the track to configure.
+ * \param loop_start output-frame position to rewind to, or -1 to leave it.
+ * \param loop_end exclusive output-frame position to rewind at, or -1 to
+ *                 leave it/disable an explicit end point.
+ * \returns true on success, false on error; call SDL_GetError() for details.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.3.0.
+ *
+ * \sa MIX_GetTrackLoopStart
+ * \sa MIX_GetTrackLoopEnd
+ * \sa MIX_SetTrackLoops
+ */
+extern SDL_DECLSPEC bool SDLCALL MIX_SetTrackLoopPoints(MIX_Track *track, Sint64 loop_start, Sint64 loop_end);
+
+/**
+ * Query a track's configured loop start point, in output sample frames.
+ *
+ * This reports the loop start set through MIX_SetTrackLoopPoints() or the
+ * MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER play option, expressed in the mixer's
+ * output frame unit. Returns -1 if no loop start point is configured.
+ *
+ * \param track the track to query.
+ * \returns the loop start in output sample frames, or -1 if unconfigured/error.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.3.0.
+ *
+ * \sa MIX_SetTrackLoopPoints
+ */
+extern SDL_DECLSPEC Sint64 SDLCALL MIX_GetTrackLoopStart(MIX_Track *track);
+
+/**
+ * Query a track's configured loop end point, in output sample frames.
+ *
+ * The end point is exclusive. This reports the loop end set through
+ * MIX_SetTrackLoopPoints() or the MIX_PROP_PLAY_LOOP_END_FRAME_NUMBER play
+ * option, expressed in the mixer's output frame unit. Returns -1 if no
+ * explicit loop end is configured (the track rewinds only at end of input).
+ *
+ * \param track the track to query.
+ * \returns the exclusive loop end in output sample frames, or -1 if
+ *          unconfigured/error.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.3.0.
+ *
+ * \sa MIX_SetTrackLoopPoints
+ */
+extern SDL_DECLSPEC Sint64 SDLCALL MIX_GetTrackLoopEnd(MIX_Track *track);
+
+/**
  * Query the MIX_Audio assigned to a track.
  *
  * This returns the MIX_Audio object currently assigned to `track` through a
@@ -1635,13 +1715,16 @@ extern SDL_DECLSPEC SDL_AudioStream * SDLCALL MIX_GetTrackAudioStream(MIX_Track 
  * will report how much audio is left to mix. If the track is playing, future
  * calls to this function will report different values.
  *
- * Remaining audio is defined in _sample frames_ of decoded audio, not units
- * of time, so that sample-perfect mixing can be achieved. To instead operate
- * in units of time, use MIX_TrackFramesToMS() to convert the return value to
- * milliseconds.
+ * Remaining audio is defined in _sample frames_ of the mixer's output (the
+ * same unit used for loop points and MIX_GetTrackPlaybackPosition()), not
+ * units of time, so that sample-perfect mixing can be achieved even when the
+ * input is resampled for the mixer. To instead operate in units of time, use
+ * MIX_TrackFramesToMS() to convert the return value to milliseconds.
  *
- * This function does not take into account fade-outs or looping, just the
- * current mixing position vs the duration of the track.
+ * This does not take into account fade-outs or future loop rewinds; it reports
+ * the frames between the current mixing position and the effective end point
+ * (a configured loop end or max frame, otherwise the end of the input), and so
+ * decreases linearly as the track mixes.
  *
  * If the duration of the track isn't known, or `track` is NULL, this function
  * returns -1. A stopped track reports 0.
@@ -1840,14 +1923,25 @@ extern SDL_DECLSPEC Sint64 SDLCALL MIX_FramesToMS(int sample_rate, Sint64 frames
  *   milliseconds instead of sample frames. If both properties are specified,
  *   the sample frames value is favored. Default 0.
  * - `MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER`: If the track is looping, this is
- *   the sample frame position that the track will loop back to; this lets one
- *   play an intro at the start of a track on the first iteration, but have a
- *   loop point somewhere in the middle thereafter. A value <= 0 will begin
- *   the loop from the start of the track's input. Default 0.
+ *   the sample frame position, in the mixer's output frame unit, that the
+ *   track will loop back to; this lets one play an intro at the start of a
+ *   track on the first iteration, but have a loop point somewhere in the
+ *   middle thereafter. A value <= 0 will begin the loop from the start of the
+ *   track's input. Default 0.
  * - `MIX_PROP_PLAY_LOOP_START_MILLISECOND_NUMBER`: The same as using the
  *   MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER property, but the value is
  *   specified in milliseconds instead of sample frames. If both properties
  *   are specified, the sample frames value is favored. Default 0.
+ * - `MIX_PROP_PLAY_LOOP_END_FRAME_NUMBER`: If the track is looping, this is
+ *   the exclusive sample frame position, in the mixer's output frame unit, at
+ *   which the track rewinds to the loop start instead of playing through to
+ *   end of input. The frame at this position is not mixed, so each loop
+ *   iteration ends exactly on the boundary, with no extra tail frame. A value
+ *   < 0 disables an explicit loop end. Default -1.
+ * - `MIX_PROP_PLAY_LOOP_END_MILLISECOND_NUMBER`: The same as using the
+ *   MIX_PROP_PLAY_LOOP_END_FRAME_NUMBER property, but the value is specified
+ *   in milliseconds instead of sample frames. If both properties are
+ *   specified, the sample frames value is favored. Default -1.
  * - `MIX_PROP_PLAY_FADE_IN_FRAMES_NUMBER`: The number of sample frames over
  *   which to fade in the newly-started track. The track will begin mixing
  *   silence and reach full volume smoothly over this many sample frames. If
@@ -1899,7 +1993,7 @@ extern SDL_DECLSPEC Sint64 SDLCALL MIX_FramesToMS(int sample_rate, Sint64 frames
  *   property, it will also be ignored. If this property is _not_ ignored, the
  *   MIX_PROP_PLAY_START_FRAME_NUMBER and
  *   MIX_PROP_PLAY_START_MILLISECOND_NUMBER properties will be ignored
- *   instead. Default -1. Since SDL_mixer 3.2.2.
+ *   instead. Default -1. Since SDL_mixer 3.3.0.
  *
  * If this function fails, mixing of this track will not start (or restart, if
  * it was already started).
@@ -1928,6 +2022,8 @@ extern SDL_DECLSPEC bool SDLCALL MIX_PlayTrack(MIX_Track *track, SDL_PropertiesI
 #define MIX_PROP_PLAY_START_ORDER_NUMBER "SDL_mixer.play.start_order"
 #define MIX_PROP_PLAY_LOOP_START_FRAME_NUMBER "SDL_mixer.play.loop_start_frame"
 #define MIX_PROP_PLAY_LOOP_START_MILLISECOND_NUMBER "SDL_mixer.play.loop_start_millisecond"
+#define MIX_PROP_PLAY_LOOP_END_FRAME_NUMBER "SDL_mixer.play.loop_end_frame"
+#define MIX_PROP_PLAY_LOOP_END_MILLISECOND_NUMBER "SDL_mixer.play.loop_end_millisecond"
 #define MIX_PROP_PLAY_FADE_IN_FRAMES_NUMBER "SDL_mixer.play.fade_in_frames"
 #define MIX_PROP_PLAY_FADE_IN_MILLISECONDS_NUMBER "SDL_mixer.play.fade_in_milliseconds"
 #define MIX_PROP_PLAY_FADE_IN_START_GAIN_FLOAT "SDL_mixer.play.fade_in_start_gain"

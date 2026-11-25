@@ -85,6 +85,9 @@ _MIX_GetAudioDecoderProperties
 _MIX_DecodeAudio
 _MIX_GetAudioDecoderFormat
 _MIX_SetTrackLoops
+_MIX_SetTrackLoopPoints
+_MIX_GetTrackLoopStart
+_MIX_GetTrackLoopEnd
 _MIX_GetTrackFadeFrames
 _MIX_GetTrackTags
 _MIX_GetTaggedTracks

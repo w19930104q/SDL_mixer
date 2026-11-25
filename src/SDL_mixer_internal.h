@@ -158,7 +158,8 @@ struct MIX_Track
     SDL_AudioSpec output_spec;  // processed data we send to SDL is in this format.
     SDL_AudioStream *output_stream;  // the stream that is bound to the audio device.
     MIX_TrackState state;  // playing, paused, stopped.
-    Uint64 position;   // sample frames played from start of file.
+    Uint64 position;   // current sample frame position in the file, in the input stream's frame rate.
+    Uint64 output_position;  // playback head in mixer output frames; advanced only as frames leave output_stream, wrapped at the loop end.
     Sint64 silence_frames;  // number of frames of silence to mix at the end of the track.
     Sint64 max_frame;   // consider audio at EOF at this many sample frame position.
     bool fire_and_forget;  // true if this is a MIX_Track managed internally for fire-and-forget playback.
@@ -167,7 +168,10 @@ struct MIX_Track
     int fade_direction;  // -1: fade out  0: don't fade  1: fade in
     float fade_start_gain;  // between 0.0f and 1.0f. Fade with this volume as the starting point (fade-in only).
     int loops_remaining;  // seek to loop_start and continue this many more times at end of input. Negative to loop forever.
-    int loop_start;      // sample frame position for loops to begin, so you can play an intro once and then loop from an internal point thereafter.
+    int loop_start;      // sample frame position for loops to begin, in the input stream's frame rate, so you can play an intro once and then loop from an internal point thereafter.
+    int loop_end;        // input-frame position at which a loop rewinds (exclusive); -1 to rewind only at end of input.
+    Sint64 loop_start_output;  // loop_start as given by the app, in output (mixer) sample frames; -1 if unconfigured.
+    Sint64 loop_end_output;    // loop end as given by the app, in output (mixer) sample frames (exclusive); -1 if disabled.
     SDL_PropertiesID tags;  // lookup tags to see if they are currently applied to this track (true or false).
     MIX_TrackMixCallback raw_callback;
     void *raw_callback_userdata;
