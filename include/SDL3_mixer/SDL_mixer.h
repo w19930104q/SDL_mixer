@@ -1244,6 +1244,43 @@ extern SDL_DECLSPEC bool SDLCALL MIX_SetTrackAudio(MIX_Track *track, MIX_Audio *
 extern SDL_DECLSPEC bool SDLCALL MIX_SetTrackAudioStream(MIX_Track *track, SDL_AudioStream *stream);
 
 /**
+ * Mark a track's SDL_AudioStream input as finished.
+ *
+ * This is used with a track whose input was assigned through
+ * MIX_SetTrackAudioStream(), to signal that no more data will be added to
+ * that stream. It is intended for streaming audio that arrives in pieces
+ * (network packets, voice-chat rooms, etc), where the final piece can be
+ * appended before the track is allowed to finish.
+ *
+ * Marking a stream as finished only prevents the mixer from treating a
+ * momentarily empty stream as something it should wait on; it does _not_
+ * discard any data that is still queued in the stream. Every sample already
+ * appended, including a final partial block, will still be mixed. Once the
+ * complete queued audio has been mixed, the track will stop on that frame
+ * boundary, calling any assigned MIX_TrackStoppedCallback once, after the
+ * final frame has finished mixing.
+ *
+ * Calling this multiple times, or before any data is available, is legal.
+ * The mark is cleared when new input is assigned to the track
+ * (MIX_SetTrackAudioStream(), MIX_SetTrackAudio(), etc) or when playback is
+ * (re)started with MIX_PlayTrack().
+ *
+ * If the track is not using an SDL_AudioStream assigned through
+ * MIX_SetTrackAudioStream(), this call has no effect.
+ *
+ * \param track the track whose streaming input is finished.
+ * \returns true on success, false on error; call SDL_GetError() for details.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL_mixer 3.2.2.
+ *
+ * \sa MIX_SetTrackAudioStream
+ * \sa MIX_SetTrackStoppedCallback
+ */
+extern SDL_DECLSPEC bool SDLCALL MIX_MarkTrackAudioStreamEOF(MIX_Track *track);
+
+/**
  * Set a MIX_Track's input to an SDL_IOStream.
  *
  * This is not the recommended way to set a track's input, but this can be

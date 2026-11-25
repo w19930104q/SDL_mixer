@@ -21,6 +21,7 @@ _MIX_CreateTrack
 _MIX_DestroyTrack
 _MIX_SetTrackAudio
 _MIX_SetTrackAudioStream
+_MIX_MarkTrackAudioStreamEOF
 _MIX_SetTrackIOStream
 _MIX_SetTrackRawIOStream
 _MIX_TagTrack

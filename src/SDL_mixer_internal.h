@@ -152,6 +152,8 @@ struct MIX_Track
     bool destroy_requested;  // true if MIX_DestroyTrack called while the track is actively mixing.
     bool closeio;  // true if we should close `io` when changing track data.
     bool halt_when_exhausted;  // true if we should stop the track when input runs out.
+    bool input_stream_eof;  // true if an app-fed SDL_AudioStream will not receive any more data; data already queued must still be mixed.
+    bool stop_pending;  // true if the track ran out of input but is still draining its output_stream, so the stopped callback waits for the final frame to finish mixing.
     SDL_AudioStream *input_stream;  // used for both MIX_SetTrackAudio and MIX_SetTrackAudioStream. Maybe not owned by SDL_mixer!
     SDL_AudioStream *internal_stream;  // used with MIX_SetTrackAudio, where it is also assigned to input_stream. Owned by SDL_mixer!
     void *decoder_userdata;  // MIX_Decoder-specific data for this run, if any.

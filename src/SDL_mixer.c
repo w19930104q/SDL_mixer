@@ -223,6 +223,7 @@ static bool SDLCALL AudioDeviceChangeEventWatcher(void *userdata, SDL_Event *eve
 static void TrackStopped(MIX_Track *track)
 {
     SDL_assert(track->state != MIX_STATE_STOPPED);  // shouldn't be already stopped at this point.
+    track->stop_pending = false;  // a deferred stop is being fulfilled now; repeated draining must not fire the callback again.
     track->state = MIX_STATE_STOPPED;
     if (track->stopped_callback) {
         track->stopped_callback(track->stopped_callback_userdata, track);
@@ -385,8 +386,14 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
 
         // if input_audio and input_stream are both NULL, there's nothing to play (maybe they changed out the input on us?), br will be zero and we'll go to end_of_audio=true.
 
-        if (br <= 0) {  // if 0: EOF. if < 0: decoding/input failure, we're done by default. But maybe it'll loop and play the start again...!
-            end_of_audio = true;
+        if (br <= 0) {  // if 0: no data available. if < 0: decoding/input failure, we're done by default. But maybe it'll loop and play the start again...!
+            // An app-fed SDL_AudioStream can legitimately run dry between network packets while more
+            //  data is still coming. We only treat it as end-of-audio once the app marked the stream
+            //  as EOF; the data already queued in the stream is never discarded by that mark.
+            const bool stream_waiting_for_more_data = (br == 0) && track->input_stream && !track->input_audio && !track->input_stream_eof;
+            if (!stream_waiting_for_more_data) {
+                end_of_audio = true;
+            }
         } else {
             SDL_assert(track->input_stream != NULL);  // should have data bound if you landed here.
 
@@ -443,6 +450,13 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
         if (end_of_audio) {
             if (track->input_audio) {
                 SDL_ClearAudioStream(track->input_stream);   // make sure that any extra buffered input is removed.
+            } else {
+                // A non-decoder input: either an app-fed stream that reached EOF, or one that was
+                //  detached while frames were already buffered in this output stream. Flush in both
+                //  cases so the converter/resampler releases its held-back tail instead of waiting
+                //  for input that will never arrive. A dry stream merely waiting for more data never
+                //  reaches this branch (it breaks above), so a still-open stream is flushed only at EOF.
+                SDL_FlushAudioStream(stream);
             }
             bool track_stopped = false;
             if (track->loops_remaining == 0) {
@@ -468,11 +482,18 @@ static void SDLCALL TrackGetCallback(void *userdata, SDL_AudioStream *stream, in
 
             if (track_stopped) {
                 if (track->halt_when_exhausted) {
-                    TrackStopped(track);
+                    // Don't call TrackStopped() here: whatever we've already put into the output
+                    //  stream still has to be mixed, including the final frame of a just-finished
+                    //  stream. Defer the stop until MixerCallback() drains the last buffered frame,
+                    //  so the stopped callback fires on the same track frame boundary as the tail.
+                    track->stop_pending = true;
+                    break;
                 } else {
                     break;  // done with this track for now, but don't halt the track. We'll try it again later.
                 }
             }
+        } else if (br == 0) {
+            break;  // an app-fed stream ran dry but isn't marked EOF yet; wait for more data instead of spinning.
         }
     }
 }
@@ -618,10 +639,24 @@ static void SDLCALL MixerCallback(void *userdata, SDL_AudioStream *stream, int a
 
             track->currently_inuse = false;
             const bool destroy_requested = track->destroy_requested;  // save this off just in case, but if the callback destroyed the track, _nothing_ else should touch it once this unlocks.
+            // A track that ran out of input still had its final frames buffered. Once that buffer
+            //  is fully drained, fulfill the deferred stop on this same frame boundary, after the last
+            //  frame has been mixed. A destroy requested during a callback takes precedence and skips it.
+            //  Keep currently_inuse set while firing the stopped callback: if that callback destroys the
+            //  track, MIX_DestroyTrack() must defer (like every other in-callback destroy) instead of
+            //  freeing it out from under this still-running mixer iteration.
+            if (track->stop_pending && !destroy_requested && (SDL_GetAudioStreamAvailable(track->output_stream) == 0)) {
+                if (track->state != MIX_STATE_STOPPED) {
+                    track->currently_inuse = true;
+                    TrackStopped(track);
+                    track->currently_inuse = false;
+                }
+            }
+            const bool destroy_after_unlock = destroy_requested || track->destroy_requested;
             UnlockTrack(track);
 
-            if (destroy_requested) {  // callback asked to destroy the track while we were still using it.
-                MIX_DestroyTrack(track);  // actually kill it now.
+            if (destroy_after_unlock) {  // callback (including one from the deferred stop above) asked to destroy the track.
+                MIX_DestroyTrack(track);  // actually kill it now, outside the track lock, with no further access to it.
             }
         }
 
@@ -1639,6 +1674,8 @@ static bool MIX_SetTrackAudio_internal(MIX_Track *track, MIX_Audio *audio, SDL_I
 
     track->input_audio = NULL;
     track->input_stream = NULL;
+    track->input_stream_eof = false;  // a new input starts unmarked; EOF only blocks future data, never survives an input change.
+    track->stop_pending = false;
 
     bool retval = true;
     if (audio) {
@@ -1739,10 +1776,53 @@ bool MIX_SetTrackAudioStream(MIX_Track *track, SDL_AudioStream *stream)
         spec.format = SDL_AUDIO_F32;  // we always work in float32.
         SDL_SetAudioStreamFormat(stream, NULL, &spec);                 // input is whatever, output is whatever in float format.
         SetTrackOutputStreamFormat(track, &spec);   // input is whatever in float format, output is to mixer->output_stream (or, if spatializing, to mixer->output_stream but mono).
+    } else if (track->input_stream && (track->input_stream != track->internal_stream)) {
+        // An app-owned stream is being detached while it may still hold samples the track never
+        //  pulled (the get-callback only reads on demand). Pull that tail into the output stream
+        //  now, so the remaining frames are still mixed on the next runs instead of vanishing with
+        //  the detached stream, and flush so the converter/resampler releases its held-back frames.
+        int avail = SDL_GetAudioStreamAvailable(track->input_stream);
+        if (avail > 0) {
+            if ((size_t) avail > track->input_buffer_len) {
+                void *ptr = SDL_realloc(track->input_buffer, avail);
+                if (ptr) {
+                    track->input_buffer = (float *) ptr;
+                    track->input_buffer_len = avail;
+                } else {
+                    avail = 0;  // out of memory; fall through and drop the tail rather than fail the detach.
+                }
+            }
+            if (avail > 0) {
+                const int got = SDL_GetAudioStreamData(track->input_stream, track->input_buffer, avail);
+                if (got > 0) {
+                    SDL_PutAudioStreamData(track->output_stream, track->input_buffer, got);
+                }
+            }
+        }
+        SDL_FlushAudioStream(track->output_stream);
     }
 
     track->input_stream = stream;
     track->position = 0;
+    track->input_stream_eof = false;  // a freshly assigned stream has no EOF mark yet.
+    track->stop_pending = false;
+    UnlockTrack(track);
+
+    return true;
+}
+
+bool MIX_MarkTrackAudioStreamEOF(MIX_Track *track)
+{
+    if (!CheckTrackParam(track)) {
+        return false;
+    }
+
+    LockTrack(track);
+    // Only an app-owned SDL_AudioStream can run dry while more data is expected. Decoder-backed
+    //  inputs already know their own end-of-data, so the mark is meaningless (and harmless) there.
+    if (track->input_stream && (track->input_stream != track->internal_stream)) {
+        track->input_stream_eof = true;
+    }
     UnlockTrack(track);
 
     return true;
@@ -2325,6 +2405,8 @@ bool MIX_PlayTrack(MIX_Track *track, SDL_PropertiesID options)
     track->state = MIX_STATE_PLAYING;
     track->position = start_pos;
     track->halt_when_exhausted = halt_when_exhausted;
+    track->input_stream_eof = false;  // a fresh playthrough waits for the app to mark EOF again.
+    track->stop_pending = false;  // starting (or restarting) cancels any stop still waiting to drain.
 
     UnlockTrack(track);
     return true;
@@ -2407,6 +2489,7 @@ static void StopTrack(MIX_Track *track, Sint64 fade_out_frames)
             if (track->internal_stream) {
                 SDL_ClearAudioStream(track->internal_stream);  // make sure we don't leave old data hanging around.
             }
+            track->stop_pending = false;  // an immediate stop supersedes any deferred one.
             track->currently_inuse = true;
             TrackStopped(track);
             track->currently_inuse = false;
