@@ -73,7 +73,7 @@ static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_quad[] = { {
 static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_4_1[] = { { P(45), 1 }, { P(135), 0 }, { P(225), 3 }, { P(315), 4 } };
 static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_5_1[] = { { P(60), 1 }, { P(90), 2 }, { P(120), 0 }, { P(240), 4 }, { P(300), 5 } };
 static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_6_1[] = { { P(60), 1 }, { P(90), 2 }, { P(120), 0 }, { P(190), 5 }, { P(270), 4 }, { P(350), 6 } };
-static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_7_1[] = { { P(0), 7 }, { P(60), 1 }, { P(90), 2 }, { P(120), 0 }, { P(200), 6 }, { P(240), 4 }, { P(300), 5 } };
+static const MIX_VBAP2D_SpeakerPosition MIX_VBAP2D_SpeakerPositions_7_1[] = { { P(0), 7 }, { P(60), 1 }, { P(90), 2 }, { P(120), 0 }, { P(180), 6 }, { P(240), 4 }, { P(300), 5 } };
 static const MIX_VBAP2D_SpeakerLayout MIX_VBAP2D_SpeakerLayouts[MIX_VBAP2D_MAX_SPEAKER_COUNT-3] = {  // -3 to skip mono/stereo/2.1
     { MIX_VBAP2D_SpeakerPositions_quad, -1 },
     { MIX_VBAP2D_SpeakerPositions_4_1, 2 },
@@ -152,23 +152,39 @@ static void MIX_VBAP2D_CalculateGains(const MIX_VBAP2D *vbap2d, float source_ang
     while (source_angle < 0.0f) {
         source_angle += 2.0f * SDL_PI_F;
     }
-    while (source_angle > (2.0f * SDL_PI_F)) {
+    while (source_angle >= (2.0f * SDL_PI_F)) {  // exactly 2pi must wrap to zero, or it indexes past the bucket array.
         source_angle -= 2.0f * SDL_PI_F;
     }
 
     const float source_x = SDL_cosf(source_angle);
     const float source_y = SDL_sinf(source_angle);
-    const int span = MIX_VBAP2D_angle_to_span(source_angle);
+    int span = MIX_VBAP2D_angle_to_span(source_angle);
+    while (span >= MIX_VBAP2D_RESOLUTION) {  // don't let rounding index past the bucket array.
+        span -= MIX_VBAP2D_RESOLUTION;
+    }
+    while (span < 0) {
+        span += MIX_VBAP2D_RESOLUTION;
+    }
     const int speaker_pair = vbap2d->buckets[span].speaker_pair;
     int vbap_speakers[2];
 
     MIX_VBAP2D_unpack_speaker_pair(speaker_pair, speaker_count, vbap_speakers);
 
     const MIX_VBAP2D_Matrix *matrix = &vbap2d->matrices[speaker_pair];
-    const float gain_a = source_x * matrix->a00 + source_y * matrix->a01;
-    const float gain_b = source_x * matrix->a10 + source_y * matrix->a11;
+    float gain_a = source_x * matrix->a00 + source_y * matrix->a01;
+    float gain_b = source_x * matrix->a10 + source_y * matrix->a11;
 
-    const float scale = 1.0f / SDL_sqrtf(gain_a * gain_a + gain_b * gain_b);
+    // the source is always inside this speaker pair's arc, so gains can't be
+    //  negative in theory; clamp away tiny negative results from rounding.
+    if (gain_a < 0.0f) {
+        gain_a = 0.0f;
+    }
+    if (gain_b < 0.0f) {
+        gain_b = 0.0f;
+    }
+
+    const float norm = (gain_a * gain_a) + (gain_b * gain_b);
+    const float scale = (norm > 0.0f) ? (1.0f / SDL_sqrtf(norm)) : 0.0f;
 
     const float gain_a_normalized = gain_a * scale;
     const float gain_b_normalized = gain_b * scale;
